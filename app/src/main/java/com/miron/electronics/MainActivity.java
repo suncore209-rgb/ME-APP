@@ -35,7 +35,7 @@ public class MainActivity extends Activity {
     // ══════════════════════════════════════════════
     //  👇 আপনার Vercel App URL এখানে দিন
     // ══════════════════════════════════════════════
-    private static final String APP_URL = "https://YOUR-APP.vercel.app";
+    private static final String APP_URL = "https://mev5.vercel.app/";
 
     private WebView webView;
     private SwipeRefreshLayout swipeRefresh;
