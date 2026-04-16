@@ -4,13 +4,14 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Bundle;
 import android.print.PrintAttributes;
-import android.print.PrintDocumentAdapter;
 import android.print.PrintManager;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -27,23 +28,40 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
+import androidx.core.content.FileProvider;
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
+import java.io.File;
+import java.io.FileOutputStream;
 
 public class MainActivity extends Activity {
 
-    // ══════════════════════════════════════════════
-    //  👇 আপনার Vercel App URL এখানে দিন
-    // ══════════════════════════════════════════════
-    private static final String APP_URL = "https://mev5.vercel.app/";
+    private static final String APP_URL = "https://YOUR-APP.vercel.app";
+    private static final int FILE_CHOOSER_REQUEST = 100;
 
-    private WebView webView;
+    private ScrollAwareWebView webView;
     private SwipeRefreshLayout swipeRefresh;
     private LinearLayout offlineLayout;
     private ValueCallback<Uri[]> fileChooserCallback;
-    private static final int FILE_CHOOSER_REQUEST = 100;
 
-    // ── Android bridge: receives slip from JS ─────
+    // ══════════════════════════════════════════════
+    //  ScrollAwareWebView — fixes over-refresh bug
+    // ══════════════════════════════════════════════
+    private class ScrollAwareWebView extends WebView {
+        public ScrollAwareWebView(Context ctx) { super(ctx); }
+
+        @Override
+        protected void onScrollChanged(int l, int t, int oldl, int oldt) {
+            super.onScrollChanged(l, t, oldl, oldt);
+            // Only allow pull-to-refresh when truly at the very top
+            if (swipeRefresh != null) swipeRefresh.setEnabled(t == 0);
+        }
+    }
+
+    // ══════════════════════════════════════════════
+    //  JS Bridge — receives slip from JS
+    // ══════════════════════════════════════════════
     public class SlipBridge {
         @JavascriptInterface
         public void receiveSlip(final String html, final String slipText) {
@@ -51,120 +69,179 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ── Native slip dialog ────────────────────────
+    // ══════════════════════════════════════════════
+    //  Slip dialog — WebView preview + share options
+    // ══════════════════════════════════════════════
     private void showSlipDialog(String html, String slipText) {
-        // Full-screen dialog
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#F5F5F5"));
+        root.setBackgroundColor(Color.WHITE);
 
-        // WebView showing the slip
+        // Loading spinner shown while WebView renders
+        ProgressBar progress = new ProgressBar(this);
+        progress.setLayoutParams(new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 200));
+        progress.setIndeterminate(true);
+
+        // Slip WebView
         WebView slipView = new WebView(this);
-        slipView.getSettings().setJavaScriptEnabled(true);
-        slipView.getSettings().setDomStorageEnabled(true);
+        slipView.setBackgroundColor(Color.WHITE);
         slipView.setLayoutParams(new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-        slipView.loadDataWithBaseURL(
-            "https://fonts.googleapis.com", html, "text/html", "UTF-8", null);
+        slipView.setVisibility(View.GONE); // hidden until loaded
 
-        // Button row
+        WebSettings ws = slipView.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(true);
+        ws.setLoadWithOverviewMode(true);
+        ws.setUseWideViewPort(true);
+        ws.setBuiltInZoomControls(true);
+        ws.setDisplayZoomControls(false);
+
+        // Button row (disabled until slip loads)
         LinearLayout btnRow = new LinearLayout(this);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setPadding(10, 10, 10, 10);
+        btnRow.setPadding(8, 10, 8, 10);
         btnRow.setGravity(Gravity.CENTER);
-        btnRow.setBackgroundColor(Color.WHITE);
+        btnRow.setBackgroundColor(Color.parseColor("#F5F5F5"));
 
-        // WhatsApp
-        Button waBtn = makeBtn("📲 WhatsApp", "#25D366");
-        // PDF/Print
-        Button pdfBtn = makeBtn("📄 PDF সেভ", "#0D47A1");
-        // Share
-        Button shareBtn = makeBtn("📤 শেয়ার", "#546E7A");
-        // Close
-        Button closeBtn = makeBtn("✕ বন্ধ", "#ECEFF1");
+        Button waBtn    = makeBtn("📲 WhatsApp", "#25D366", true);
+        Button imgBtn   = makeBtn("🖼 Image শেয়ার", "#E65100", true);
+        Button pdfBtn   = makeBtn("📄 PDF", "#0D47A1", true);
+        Button closeBtn = makeBtn("✕", "#ECEFF1", true);
         closeBtn.setTextColor(Color.parseColor("#333333"));
 
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0,
-            LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        bp.setMargins(4,0,4,0);
-        waBtn.setLayoutParams(bp);
-        pdfBtn.setLayoutParams(new LinearLayout.LayoutParams(0,
-            LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        shareBtn.setLayoutParams(new LinearLayout.LayoutParams(0,
-            LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        closeBtn.setLayoutParams(new LinearLayout.LayoutParams(0,
-            LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        // Disable buttons until loaded
+        waBtn.setEnabled(false); imgBtn.setEnabled(false); pdfBtn.setEnabled(false);
 
-        btnRow.addView(waBtn);
-        btnRow.addView(pdfBtn);
-        btnRow.addView(shareBtn);
-        btnRow.addView(closeBtn);
+        setWeight(waBtn,  1f); setWeight(imgBtn, 1f);
+        setWeight(pdfBtn, 1f); setWeight(closeBtn, 0.6f);
+        btnRow.addView(waBtn); btnRow.addView(imgBtn);
+        btnRow.addView(pdfBtn); btnRow.addView(closeBtn);
 
+        root.addView(progress);
         root.addView(slipView);
         root.addView(btnRow);
 
         AlertDialog dialog = builder.setView(root).create();
 
-        // WhatsApp share
-        waBtn.setOnClickListener(v -> {
-            try {
-                Intent i = new Intent(Intent.ACTION_SEND);
-                i.setType("text/plain");
-                i.setPackage("com.whatsapp");
-                i.putExtra(Intent.EXTRA_TEXT, slipText);
-                startActivity(i);
-            } catch (Exception e) {
-                // WhatsApp নেই — general share
-                Intent i = new Intent(Intent.ACTION_SEND);
-                i.setType("text/plain");
-                i.putExtra(Intent.EXTRA_TEXT, slipText);
-                startActivity(Intent.createChooser(i, "শেয়ার করুন"));
+        // Show WebView only after fully rendered
+        slipView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                progress.setVisibility(View.GONE);
+                slipView.setVisibility(View.VISIBLE);
+                // Enable buttons now
+                waBtn.setEnabled(true);
+                imgBtn.setEnabled(true);
+                pdfBtn.setEnabled(true);
             }
         });
 
-        // PDF save via Android PrintManager
-        pdfBtn.setOnClickListener(v -> {
-            PrintManager pm = (PrintManager) getSystemService(Context.PRINT_SERVICE);
-            PrintDocumentAdapter adapter =
-                slipView.createPrintDocumentAdapter("মিরন-স্লিপ");
-            PrintAttributes attrs = new PrintAttributes.Builder()
-                .setMediaSize(PrintAttributes.MediaSize.ISO_A5)
-                .setResolution(new PrintAttributes.Resolution("pdf","pdf",300,300))
-                .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
-                .build();
-            pm.print("Miron Slip", adapter, attrs);
+        // Load slip HTML — use null base URL for inline content
+        slipView.loadDataWithBaseURL(
+            "https://fonts.gstatic.com", html, "text/html", "UTF-8", null);
+
+        // ── WhatsApp — share as image ──────────────
+        waBtn.setOnClickListener(v -> {
+            Uri imgUri = captureAndSave(slipView, "slip_wa");
+            if (imgUri != null) {
+                try {
+                    Intent i = new Intent(Intent.ACTION_SEND);
+                    i.setType("image/png");
+                    i.setPackage("com.whatsapp");
+                    i.putExtra(Intent.EXTRA_STREAM, imgUri);
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivity(i);
+                } catch (Exception e) {
+                    // WhatsApp নেই — text fallback
+                    Intent i = new Intent(Intent.ACTION_SEND);
+                    i.setType("text/plain");
+                    i.putExtra(Intent.EXTRA_TEXT, slipText);
+                    startActivity(Intent.createChooser(i, "WhatsApp"));
+                }
+            }
         });
 
-        // General share (text)
-        shareBtn.setOnClickListener(v -> {
-            Intent i = new Intent(Intent.ACTION_SEND);
-            i.setType("text/plain");
-            i.putExtra(Intent.EXTRA_TEXT, slipText);
-            startActivity(Intent.createChooser(i, "শেয়ার করুন"));
+        // ── Image share — any app ──────────────────
+        imgBtn.setOnClickListener(v -> {
+            Uri imgUri = captureAndSave(slipView, "slip_share");
+            if (imgUri != null) {
+                Intent i = new Intent(Intent.ACTION_SEND);
+                i.setType("image/png");
+                i.putExtra(Intent.EXTRA_STREAM, imgUri);
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                startActivity(Intent.createChooser(i, "স্লিপ শেয়ার করুন"));
+            }
+        });
+
+        // ── PDF via Android PrintManager ───────────
+        pdfBtn.setOnClickListener(v -> {
+            PrintManager pm = (PrintManager) getSystemService(PRINT_SERVICE);
+            pm.print("মিরন-স্লিপ",
+                slipView.createPrintDocumentAdapter("মিরন-স্লিপ"),
+                new PrintAttributes.Builder()
+                    .setMediaSize(PrintAttributes.MediaSize.ISO_A5)
+                    .setResolution(new PrintAttributes.Resolution("p","p",300,300))
+                    .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
+                    .build());
         });
 
         closeBtn.setOnClickListener(v -> dialog.dismiss());
 
         dialog.show();
         Window w = dialog.getWindow();
-        if (w != null) {
-            w.setLayout(WindowManager.LayoutParams.MATCH_PARENT,
-                        WindowManager.LayoutParams.MATCH_PARENT);
+        if (w != null) w.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT);
+    }
+
+    // Capture WebView as PNG and return FileProvider Uri
+    private Uri captureAndSave(WebView wv, String name) {
+        try {
+            float d = getResources().getDisplayMetrics().density;
+            int h = Math.max((int)(wv.getContentHeight() * d), 100);
+            int w = Math.max(wv.getWidth(), 100);
+
+            Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            bmp.eraseColor(Color.WHITE);
+            Canvas c = new Canvas(bmp);
+            wv.draw(c);
+
+            File out = new File(getCacheDir(), name + ".png");
+            FileOutputStream fos = new FileOutputStream(out);
+            bmp.compress(Bitmap.CompressFormat.PNG, 95, fos);
+            fos.flush(); fos.close();
+
+            return FileProvider.getUriForFile(this,
+                getPackageName() + ".provider", out);
+        } catch (Exception e) {
+            return null;
         }
     }
 
-    private Button makeBtn(String text, String color) {
+    private Button makeBtn(String text, String color, boolean small) {
         Button b = new Button(this);
         b.setText(text);
-        b.setTextSize(11);
+        b.setTextSize(small ? 11 : 13);
         b.setBackgroundColor(Color.parseColor(color));
         b.setTextColor(Color.WHITE);
-        b.setPadding(6, 14, 6, 14);
+        b.setPadding(4, 12, 4, 12);
         return b;
     }
 
+    private void setWeight(Button b, float w) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, w);
+        p.setMargins(3, 0, 3, 0);
+        b.setLayoutParams(p);
+    }
+
+    // ══════════════════════════════════════════════
+    //  onCreate
+    // ══════════════════════════════════════════════
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -183,12 +260,10 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.MATCH_PARENT, 1f));
         swipeRefresh.setColorSchemeColors(Color.parseColor("#0D47A1"));
+        swipeRefresh.setEnabled(true); // start enabled (at top)
 
-        // ✅ Only refresh when truly at top
-        swipeRefresh.setOnChildScrollUpCallback((parent, child) ->
-            webView != null && webView.getScrollY() > 0);
-
-        webView = new WebView(this);
+        // ── ScrollAwareWebView ─────────────────────
+        webView = new ScrollAwareWebView(this);
         webView.setLayoutParams(new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.MATCH_PARENT));
@@ -204,26 +279,25 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(true);
         s.setAllowContentAccess(true);
 
-        // ✅ Register slip bridge — JS calls AndroidSlip.receiveSlip()
         webView.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
-                view.loadUrl(req.getUrl().toString()); return true;
+            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                v.loadUrl(r.getUrl().toString()); return true;
             }
             @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
+            public void onPageFinished(WebView v, String url) {
+                super.onPageFinished(v, url);
                 swipeRefresh.setRefreshing(false);
                 offlineLayout.setVisibility(View.GONE);
                 swipeRefresh.setVisibility(View.VISIBLE);
             }
             @Override
-            public void onReceivedError(WebView view, WebResourceRequest req,
-                    android.webkit.WebResourceError err) {
+            public void onReceivedError(WebView v, WebResourceRequest r,
+                    android.webkit.WebResourceError e) {
                 swipeRefresh.setRefreshing(false);
-                if (req.isForMainFrame()) {
+                if (r.isForMainFrame()) {
                     swipeRefresh.setVisibility(View.GONE);
                     offlineLayout.setVisibility(View.VISIBLE);
                 }
@@ -232,28 +306,26 @@ public class MainActivity extends Activity {
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
-            public boolean onJsConfirm(WebView v, String url, String msg, JsResult r) {
-                new AlertDialog.Builder(MainActivity.this)
-                    .setMessage(msg)
+            public boolean onJsConfirm(WebView v, String u, String m, JsResult r) {
+                new AlertDialog.Builder(MainActivity.this).setMessage(m)
                     .setPositiveButton("হ্যাঁ", (d,w)->r.confirm())
                     .setNegativeButton("না",    (d,w)->r.cancel())
                     .setOnCancelListener(d->r.cancel()).create().show();
                 return true;
             }
             @Override
-            public boolean onJsAlert(WebView v, String url, String msg, JsResult r) {
-                new AlertDialog.Builder(MainActivity.this)
-                    .setMessage(msg)
+            public boolean onJsAlert(WebView v, String u, String m, JsResult r) {
+                new AlertDialog.Builder(MainActivity.this).setMessage(m)
                     .setPositiveButton("ঠিক আছে",(d,w)->r.confirm())
                     .setOnCancelListener(d->r.confirm()).create().show();
                 return true;
             }
             @Override
-            public boolean onShowFileChooser(WebView wv,
-                    ValueCallback<Uri[]> cb, FileChooserParams params) {
+            public boolean onShowFileChooser(WebView wv, ValueCallback<Uri[]> cb,
+                    FileChooserParams p) {
                 if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
                 fileChooserCallback = cb;
-                try { startActivityForResult(params.createIntent(), FILE_CHOOSER_REQUEST); }
+                try { startActivityForResult(p.createIntent(), FILE_CHOOSER_REQUEST); }
                 catch (Exception e) { fileChooserCallback = null; return false; }
                 return true;
             }
@@ -269,7 +341,7 @@ public class MainActivity extends Activity {
         });
         swipeRefresh.addView(webView);
 
-        // Offline view
+        // ── Offline view ───────────────────────────
         offlineLayout = new LinearLayout(this);
         offlineLayout.setOrientation(LinearLayout.VERTICAL);
         offlineLayout.setGravity(Gravity.CENTER);
@@ -279,9 +351,8 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.MATCH_PARENT));
 
-        TextView icon = new TextView(this);
-        icon.setText("📡"); icon.setTextSize(48);
-        icon.setGravity(Gravity.CENTER);
+        TextView ico = new TextView(this);
+        ico.setText("📡"); ico.setTextSize(48); ico.setGravity(Gravity.CENTER);
 
         TextView msg = new TextView(this);
         msg.setText("ইন্টারনেট সংযোগ নেই\nঅনুগ্রহ করে সংযোগ দিন");
@@ -299,13 +370,9 @@ public class MainActivity extends Activity {
                 webView.loadUrl(APP_URL);
             }
         });
+        offlineLayout.addView(ico); offlineLayout.addView(msg); offlineLayout.addView(retry);
 
-        offlineLayout.addView(icon);
-        offlineLayout.addView(msg);
-        offlineLayout.addView(retry);
-
-        root.addView(swipeRefresh);
-        root.addView(offlineLayout);
+        root.addView(swipeRefresh); root.addView(offlineLayout);
         setContentView(root);
 
         if (isOnline()) webView.loadUrl(APP_URL);
@@ -333,7 +400,9 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean onKeyDown(int kc, KeyEvent e) {
-        if (kc == KeyEvent.KEYCODE_BACK && webView.canGoBack()) { webView.goBack(); return true; }
+        if (kc == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+            webView.goBack(); return true;
+        }
         return super.onKeyDown(kc, e);
     }
     @Override protected void onResume()  { super.onResume();  webView.onResume();  }
