@@ -1,16 +1,21 @@
 package com.miron.electronics;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Color;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
+import android.net.Uri;
 import android.os.Bundle;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
-import android.webkit.CookieManager;
+import android.webkit.JsResult;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -25,17 +30,20 @@ public class MainActivity extends Activity {
     // ══════════════════════════════════════════════
     //  👇 আপনার Vercel App URL এখানে দিন
     // ══════════════════════════════════════════════
-    private static final String APP_URL = "https://mev5.vercel.app/";
+    private static final String APP_URL = "https://YOUR-APP.vercel.app";
 
     private WebView webView;
     private SwipeRefreshLayout swipeRefresh;
     private LinearLayout offlineLayout;
 
+    // File chooser for image upload
+    private ValueCallback<Uri[]> fileChooserCallback;
+    private static final int FILE_CHOOSER_REQUEST = 100;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Full screen — status bar থাকবে, action bar থাকবে না
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(
             WindowManager.LayoutParams.FLAG_FULLSCREEN,
@@ -50,7 +58,7 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams.MATCH_PARENT
         ));
 
-        // ── SwipeRefreshLayout (নিচে টানলে refresh) ─
+        // ── SwipeRefreshLayout ───────────────────────
         swipeRefresh = new SwipeRefreshLayout(this);
         swipeRefresh.setLayoutParams(new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -74,32 +82,27 @@ public class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setAllowFileAccess(true);
+        settings.setAllowContentAccess(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setSupportZoom(false);
+        settings.setSupportMultipleWindows(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
 
-        // Cookies enable
-        CookieManager.getInstance().setAcceptCookie(true);
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
-
+        // ── WebViewClient ────────────────────────────
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                // সব link একই WebView এ খুলবে
                 view.loadUrl(request.getUrl().toString());
                 return true;
             }
-
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 swipeRefresh.setRefreshing(false);
-                // Page load হলে offline message লুকাও
                 offlineLayout.setVisibility(View.GONE);
                 swipeRefresh.setVisibility(View.VISIBLE);
             }
-
             @Override
-            public void onReceivedError(android.webkit.WebView view,
+            public void onReceivedError(WebView view,
                     android.webkit.WebResourceRequest request,
                     android.webkit.WebResourceError error) {
                 swipeRefresh.setRefreshing(false);
@@ -110,10 +113,72 @@ public class MainActivity extends Activity {
             }
         });
 
+        // ── WebChromeClient — confirm, alert, file ───
+        webView.setWebChromeClient(new WebChromeClient() {
+
+            // ✅ confirm() dialog — delete এর জন্য
+            @Override
+            public boolean onJsConfirm(WebView view, String url,
+                    String message, final JsResult result) {
+                new AlertDialog.Builder(MainActivity.this)
+                    .setMessage(message)
+                    .setPositiveButton("হ্যাঁ", (d, w) -> result.confirm())
+                    .setNegativeButton("না", (d, w) -> result.cancel())
+                    .setOnCancelListener(d -> result.cancel())
+                    .create().show();
+                return true;
+            }
+
+            // ✅ alert() dialog
+            @Override
+            public boolean onJsAlert(WebView view, String url,
+                    String message, final JsResult result) {
+                new AlertDialog.Builder(MainActivity.this)
+                    .setMessage(message)
+                    .setPositiveButton("ঠিক আছে", (d, w) -> result.confirm())
+                    .setOnCancelListener(d -> result.confirm())
+                    .create().show();
+                return true;
+            }
+
+            // ✅ Image upload — file picker
+            @Override
+            public boolean onShowFileChooser(WebView webView,
+                    ValueCallback<Uri[]> filePathCallback,
+                    FileChooserParams fileChooserParams) {
+                if (fileChooserCallback != null) {
+                    fileChooserCallback.onReceiveValue(null);
+                }
+                fileChooserCallback = filePathCallback;
+                Intent intent = fileChooserParams.createIntent();
+                try {
+                    startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                } catch (Exception e) {
+                    fileChooserCallback = null;
+                    return false;
+                }
+                return true;
+            }
+
+            // ✅ window.open() — slip print এর জন্য
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog,
+                    boolean isUserGesture, android.os.Message resultMsg) {
+                WebView popup = new WebView(MainActivity.this);
+                popup.getSettings().setJavaScriptEnabled(true);
+                popup.setWebViewClient(new WebViewClient());
+                WebView.WebViewTransport transport =
+                    (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(popup);
+                resultMsg.sendToTarget();
+                return true;
+            }
+        });
+
+        // Swipe to refresh
         swipeRefresh.setOnRefreshListener(() -> {
-            if (isOnline()) {
-                webView.reload();
-            } else {
+            if (isOnline()) webView.reload();
+            else {
                 swipeRefresh.setRefreshing(false);
                 swipeRefresh.setVisibility(View.GONE);
                 offlineLayout.setVisibility(View.VISIBLE);
@@ -122,7 +187,7 @@ public class MainActivity extends Activity {
 
         swipeRefresh.addView(webView);
 
-        // ── Offline message layout ───────────────────
+        // ── Offline layout ───────────────────────────
         offlineLayout = new LinearLayout(this);
         offlineLayout.setOrientation(LinearLayout.VERTICAL);
         offlineLayout.setGravity(android.view.Gravity.CENTER);
@@ -163,28 +228,42 @@ public class MainActivity extends Activity {
         offlineLayout.addView(offlineText);
         offlineLayout.addView(retryBtn);
 
-        // ── Assemble ─────────────────────────────────
         root.addView(swipeRefresh);
         root.addView(offlineLayout);
         setContentView(root);
 
-        // ── Load app ─────────────────────────────────
-        if (isOnline()) {
-            webView.loadUrl(APP_URL);
-        } else {
+        if (isOnline()) webView.loadUrl(APP_URL);
+        else {
             swipeRefresh.setVisibility(View.GONE);
             offlineLayout.setVisibility(View.VISIBLE);
         }
     }
 
-    // Internet connection check
+    // ✅ File chooser result
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == FILE_CHOOSER_REQUEST) {
+            if (fileChooserCallback != null) {
+                Uri[] results = null;
+                if (resultCode == Activity.RESULT_OK && data != null) {
+                    String dataString = data.getDataString();
+                    if (dataString != null) {
+                        results = new Uri[]{Uri.parse(dataString)};
+                    }
+                }
+                fileChooserCallback.onReceiveValue(results);
+                fileChooserCallback = null;
+            }
+        }
+    }
+
     private boolean isOnline() {
-        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        ConnectivityManager cm =
+            (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         NetworkInfo info = cm.getActiveNetworkInfo();
         return info != null && info.isConnected();
     }
 
-    // Back button — WebView এ back যাবে
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
@@ -194,21 +273,7 @@ public class MainActivity extends Activity {
         return super.onKeyDown(keyCode, event);
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        webView.onResume();
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        webView.onPause();
-    }
-
-    @Override
-    protected void onDestroy() {
-        webView.destroy();
-        super.onDestroy();
-    }
+    @Override protected void onResume()  { super.onResume();  webView.onResume();  }
+    @Override protected void onPause()   { super.onPause();   webView.onPause();   }
+    @Override protected void onDestroy() { webView.destroy(); super.onDestroy();   }
 }
