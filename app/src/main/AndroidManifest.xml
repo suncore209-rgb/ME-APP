@@ -24,7 +24,6 @@
             </intent-filter>
         </activity>
 
-        <!-- FileProvider for sharing slip images -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.provider"
