@@ -135,86 +135,6 @@ public class MainActivity extends Activity {
     }
 
     // ═══════════════════════════════════════════════════
-    //  JS injection into every main page load
-    //  Intercepts window.print() (report page)
-    // ═══════════════════════════════════════════════════
-    private void injectBridgeOverrides(WebView v) {
-        String js =
-        "(function() {" +
-        "  if (window._meBridgeReady) return;" +
-        "  window._meBridgeReady = true;" +
-
-        // Capture current page → receiveImageBase64
-        "  function captureCurrentPage() {" +
-        "    if (typeof window.AndroidSlip === 'undefined') return;" +
-        "    window.AndroidSlip.showLoadingDialog();" +
-        "    function doCapture() {" +
-        "      html2canvas(document.body, {" +
-        "        scale: 2, useCORS: true, allowTaint: true," +
-        "        backgroundColor: '#ffffff', logging: false" +
-        "      }).then(function(canvas) {" +
-        "        window.AndroidSlip.receiveImageBase64(" +
-        "          canvas.toDataURL('image/jpeg', 0.93).split(',')[1]);" +
-        "      }).catch(function() {" +
-        "        window.AndroidSlip.receiveImageBase64('');" +
-        "      });" +
-        "    }" +
-        "    if (window.html2canvas) {" +
-        "      doCapture();" +
-        "    } else {" +
-        "      var sc = document.createElement('script');" +
-        "      sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';" +
-        "      sc.onload = doCapture;" +
-        "      sc.onerror = function() { window.AndroidSlip.receiveImageBase64(''); };" +
-        "      document.head.appendChild(sc);" +
-        "    }" +
-        "  }" +
-
-        // Override window.print → capture (used by Report page)
-        "  window.print = function() { captureCurrentPage(); };" +
-
-        "})();";
-
-        v.evaluateJavascript(js, null);
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  Capture popup WebView (slip popup path)
-    // ═══════════════════════════════════════════════════
-    private void capturePopupWebView(WebView popup) {
-        String js =
-        "(function() {" +
-        // Hide the sticky button bar so it doesn't appear in image
-        "  var btns = document.querySelector('.btns');" +
-        "  if (btns) btns.style.display = 'none';" +
-        "  function doCapture() {" +
-        "    html2canvas(document.body, {" +
-        "      scale: 2, useCORS: true, allowTaint: true," +
-        "      backgroundColor: '#ffffff', logging: false" +
-        "    }).then(function(canvas) {" +
-        "      window.AndroidSlip.receiveImageBase64(" +
-        "        canvas.toDataURL('image/jpeg', 0.93).split(',')[1]);" +
-        "    }).catch(function() {" +
-        "      window.AndroidSlip.receiveImageBase64('');" +
-        "    });" +
-        "  }" +
-        "  if (window.html2canvas) {" +
-        "    doCapture();" +
-        "  } else {" +
-        "    var sc = document.createElement('script');" +
-        "    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';" +
-        "    sc.onload = doCapture;" +
-        "    sc.onerror = function() { window.AndroidSlip.receiveImageBase64(''); };" +
-        "    document.head.appendChild(sc);" +
-        "  }" +
-        "})();";
-
-        showLoading("স্লিপ ক্যাপচার হচ্ছে...");
-        // 1500ms gives Google Fonts and product thumbnails time to load
-        popup.postDelayed(() -> popup.evaluateJavascript(js, null), 1500);
-    }
-
-    // ═══════════════════════════════════════════════════
     //  Image Preview + Share Dialog
     // ═══════════════════════════════════════════════════
     private void showImagePreview(Bitmap bmp) {
@@ -420,8 +340,6 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(true);
         s.setAllowContentAccess(true);
         s.setMediaPlaybackRequiresUserGesture(false);
-        s.setSupportMultipleWindows(true);
-        s.setJavaScriptCanOpenWindowsAutomatically(true);
 
         webView.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
 
@@ -453,7 +371,6 @@ public class MainActivity extends Activity {
                 super.onPageFinished(v, url);
                 offlineLayout.setVisibility(View.GONE);
                 webView.setVisibility(View.VISIBLE);
-                injectBridgeOverrides(v);
             }
 
             @Override
@@ -495,40 +412,6 @@ public class MainActivity extends Activity {
                 return true;
             }
 
-            // ── Intercept slip popup window ──
-            // Web app: window.open('','_blank','width=480,height=740,...')
-            // then writes slip HTML and the user clicks "PDF ডাউনলোড / প্রিন্ট"
-            // We capture it automatically with html2canvas.
-            @Override
-            public boolean onCreateWindow(WebView view, boolean isDialog,
-                    boolean isUserGesture, android.os.Message resultMsg) {
-
-                WebView popup = new WebView(MainActivity.this);
-                WebSettings ps = popup.getSettings();
-                ps.setJavaScriptEnabled(true);
-                ps.setDomStorageEnabled(true);
-                ps.setLoadWithOverviewMode(true);
-                ps.setUseWideViewPort(true);
-                popup.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
-
-                // Auto-capture the popup as soon as it loads.
-                // The popup is invisible in Android WebView (window.open creates
-                // a detached WebView that is never shown). So we capture it
-                // immediately with html2canvas and show our share dialog.
-                popup.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public void onPageFinished(WebView pv, String url) {
-                        // Give the slip HTML time to fully render fonts/images,
-                        // then auto-capture — no user button tap required.
-                        capturePopupWebView(pv);
-                    }
-                });
-
-                WebView.WebViewTransport t = (WebView.WebViewTransport) resultMsg.obj;
-                t.setWebView(popup);
-                resultMsg.sendToTarget();
-                return true;
-            }
         });
 
         root.addView(webView);
