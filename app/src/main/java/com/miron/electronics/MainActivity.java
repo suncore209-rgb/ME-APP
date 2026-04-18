@@ -510,40 +510,30 @@ public class MainActivity extends Activity {
                 ps.setUseWideViewPort(true);
                 popup.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
 
+                // Only inject print override — do NOT auto-capture.
+                // User sees the slip popup, taps "PDF ডাউনলোড / প্রিন্ট"
+                // which calls window.print() → our override captures it.
                 popup.setWebViewClient(new WebViewClient() {
                     @Override
                     public void onPageFinished(WebView pv, String url) {
-                        // Popup is loaded (document.write done) → capture
-                        capturePopupWebView(pv);
-                    }
-                });
-
-                // Also override window.print in popup in case user taps button first
-                popup.setWebChromeClient(new WebChromeClient() {
-                    @Override
-                    public void onProgressChanged(WebView pv, int progress) {
-                        if (progress == 100) {
-                            pv.postDelayed(() -> {
-                                String printOverride =
-                                    "(function(){" +
-                                    "  window.print = function() {" +
-                                    "    window.AndroidSlip.showLoadingDialog();" +
-                                    "    var btns=document.querySelector('.btns');" +
-                                    "    if(btns)btns.style.display='none';" +
-                                    "    var sc=document.createElement('script');" +
-                                    "    sc.src='https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';" +
-                                    "    sc.onload=function(){" +
-                                    "      html2canvas(document.body,{scale:2,useCORS:true,backgroundColor:'#ffffff'})" +
-                                    "      .then(function(c){" +
-                                    "        window.AndroidSlip.receiveImageBase64(c.toDataURL('image/jpeg',0.93).split(',')[1]);" +
-                                    "      }).catch(function(){window.AndroidSlip.receiveImageBase64('');});" +
-                                    "    };" +
-                                    "    if(window.html2canvas){sc.onload();}else{document.head.appendChild(sc);}" +
-                                    "  };" +
-                                    "})();";
-                                pv.evaluateJavascript(printOverride, null);
-                            }, 300);
-                        }
+                        String printOverride =
+                            "(function(){" +
+                            "  window.print = function() {" +
+                            "    window.AndroidSlip.showLoadingDialog();" +
+                            "    var btns=document.querySelector('.btns');" +
+                            "    if(btns)btns.style.display='none';" +
+                            "    var sc=document.createElement('script');" +
+                            "    sc.src='https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';" +
+                            "    sc.onload=function(){" +
+                            "      html2canvas(document.body,{scale:2,useCORS:true,allowTaint:true,backgroundColor:'#ffffff',logging:false})" +
+                            "      .then(function(c){" +
+                            "        window.AndroidSlip.receiveImageBase64(c.toDataURL('image/jpeg',0.93).split(',')[1]);" +
+                            "      }).catch(function(){window.AndroidSlip.receiveImageBase64('');});" +
+                            "    };" +
+                            "    if(window.html2canvas){sc.onload();}else{document.head.appendChild(sc);}" +
+                            "  };" +
+                            "})();";
+                        pv.postDelayed(() -> pv.evaluateJavascript(printOverride, null), 400);
                     }
                 });
 
