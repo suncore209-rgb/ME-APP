@@ -144,7 +144,15 @@ public class MainActivity extends Activity {
         "  if (window._meBridgeReady) return;" +
         "  window._meBridgeReady = true;" +
 
-        // Capture current page → receiveImageBase64
+        // ── Block window.open so web app falls into receiveSlip branch ──
+        // The web app does:
+        //   var win = window.open(...);
+        //   if (win) { win.document.write(html); }
+        //   else if (window.AndroidSlip) { window.AndroidSlip.receiveSlip(html, ''); }
+        // By returning null, receiveSlip() gets called with the full HTML.
+        "  window.open = function() { return null; };" +
+
+        // ── Capture current page for Report's window.print() button ──
         "  function captureCurrentPage() {" +
         "    if (typeof window.AndroidSlip === 'undefined') return;" +
         "    window.AndroidSlip.showLoadingDialog();" +
@@ -170,7 +178,7 @@ public class MainActivity extends Activity {
         "    }" +
         "  }" +
 
-        // Override window.print → capture (used by Report page)
+        // ── Override window.print → capture (Report page PDF button) ──
         "  window.print = function() { captureCurrentPage(); };" +
 
         "})();";
