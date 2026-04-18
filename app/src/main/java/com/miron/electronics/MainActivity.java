@@ -5,21 +5,20 @@ import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.pdf.PdfDocument;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Environment;
 import android.provider.MediaStore;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
 import android.webkit.JsResult;
 import android.webkit.ValueCallback;
@@ -29,10 +28,14 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 import androidx.core.content.FileProvider;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -47,239 +50,454 @@ public class MainActivity extends Activity {
     private WebView webView;
     private LinearLayout offlineLayout;
     private ValueCallback<Uri[]> fileChooserCallback;
+    private AlertDialog loadingDialog;
 
-    // JS Bridge
+    // ═══════════════════════════════════════════════════
+    //  JS Bridge
+    // ═══════════════════════════════════════════════════
     public class SlipBridge {
+
+        // Image (JPEG base64) received from html2canvas
         @JavascriptInterface
-        public void receiveSlip(final String html, final String slipText) {
-            runOnUiThread(() -> renderSlipToPdf(html));
+        public void receiveImageBase64(final String base64) {
+            runOnUiThread(() -> {
+                dismissLoading();
+                try {
+                    byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+                    Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                    if (bmp != null) showImagePreview(bmp);
+                    else toast("ছবি তৈরি ব্যর্থ হয়েছে");
+                } catch (Exception e) {
+                    toast("সমস্যা: " + e.getMessage());
+                }
+            });
+        }
+
+        // PDF base64 received (for report downloads)
+        @JavascriptInterface
+        public void receivePdfBase64(final String base64) {
+            runOnUiThread(() -> {
+                dismissLoading();
+                try {
+                    byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+                    String fn = "miron_report_" + System.currentTimeMillis() + ".pdf";
+                    File f = new File(getCacheDir(), fn);
+                    FileOutputStream fos = new FileOutputStream(f);
+                    fos.write(bytes); fos.flush(); fos.close();
+                    Uri uri = FileProvider.getUriForFile(
+                        MainActivity.this, getPackageName() + ".provider", f);
+                    showPdfOptions(uri, f, fn);
+                } catch (Exception e) {
+                    toast("PDF সমস্যা: " + e.getMessage());
+                }
+            });
+        }
+
+        // Show loading spinner (called from JS before html2canvas runs)
+        @JavascriptInterface
+        public void showLoadingDialog() {
+            runOnUiThread(() -> showLoading("স্লিপ/রিপোর্ট তৈরি হচ্ছে..."));
         }
     }
 
-    /**
-     * KEY FIX: Inject JS that overrides window.print().
-     * WebView does NOT support window.print() — the screen goes white.
-     * We intercept it, grab the slip HTML, and send to our PDF renderer.
-     */
-    private void injectPrintOverride(WebView v) {
-        String js = "(function() {\n" +
-            "  window.print = function() {\n" +
-            "    try {\n" +
-            "      var selectors = ['#slip','.slip','[id*=\"slip\"]','[class*=\"slip\"]',\n" +
-            "                       '#printable','.printable','.invoice','#invoice',\n" +
-            "                       '[id*=\"challan\"]','[class*=\"challan\"]',\n" +
-            "                       '[id*=\"receipt\"]','[class*=\"receipt\"]'];\n" +
-            "      var el = null;\n" +
-            "      for (var s = 0; s < selectors.length; s++) {\n" +
-            "        el = document.querySelector(selectors[s]);\n" +
-            "        if (el) break;\n" +
-            "      }\n" +
-            "      var styles = '';\n" +
-            "      try {\n" +
-            "        var sheets = document.styleSheets;\n" +
-            "        for (var i = 0; i < sheets.length; i++) {\n" +
-            "          var rules;\n" +
-            "          try { rules = sheets[i].cssRules || sheets[i].rules; } catch(e) { continue; }\n" +
-            "          if (rules) { for (var j = 0; j < rules.length; j++) { styles += rules[j].cssText + '\\n'; } }\n" +
-            "        }\n" +
-            "      } catch(e) {}\n" +
-            "      var body = el ? el.outerHTML : document.body.innerHTML;\n" +
-            "      var fullHtml = '<!DOCTYPE html><html><head><meta charset=\"utf-8\">'\n" +
-            "        + '<meta name=\"viewport\" content=\"width=device-width\">'\n" +
-            "        + '<style>body{margin:0;padding:12px;background:#fff;font-family:sans-serif;}' + styles + '</style>'\n" +
-            "        + '</head><body>' + body + '</body></html>';\n" +
-            "      window.AndroidSlip.receiveSlip(fullHtml, '');\n" +
-            "    } catch(err) {\n" +
-            "      window.AndroidSlip.receiveSlip(document.documentElement.outerHTML, '');\n" +
-            "    }\n" +
-            "  };\n" +
-            "})();";
+    // ═══════════════════════════════════════════════════
+    //  JS Injection — runs on every page load
+    //  Covers: window.print(), window.open(), <a download>, blob URLs
+    // ═══════════════════════════════════════════════════
+    private void injectBridgeOverrides(WebView v) {
+        String js =
+        "(function() {" +
+        "  if (window._androidBridgeReady) return;" +
+        "  window._androidBridgeReady = true;" +
+
+        // ── Shared capture function using html2canvas ──
+        "  function captureAndSend() {" +
+        "    window.AndroidSlip.showLoadingDialog();" +
+        "    var selectors = ['#slip','.slip','#printArea','.printArea'," +
+        "      '#printable','.printable','.invoice','#invoice'," +
+        "      '[id*=\"slip\"]','[class*=\"slip\"]'," +
+        "      '[id*=\"report\"]','[class*=\"report\"]'," +
+        "      '[id*=\"challan\"]','[id*=\"receipt\"]'];" +
+        "    var el = null;" +
+        "    for (var s=0;s<selectors.length;s++){el=document.querySelector(selectors[s]);if(el)break;}" +
+        "    if (!el) el = document.body;" +
+        "    function doCapture() {" +
+        "      html2canvas(el, {" +
+        "        scale: 2," +
+        "        useCORS: true," +
+        "        allowTaint: true," +
+        "        backgroundColor: '#ffffff'," +
+        "        logging: false" +
+        "      }).then(function(canvas) {" +
+        "        var jpeg = canvas.toDataURL('image/jpeg', 0.93);" +
+        "        var b64 = jpeg.split(',')[1];" +
+        "        window.AndroidSlip.receiveImageBase64(b64);" +
+        "      }).catch(function(e) {" +
+        "        window.AndroidSlip.receiveImageBase64('');" +
+        "      });" +
+        "    }" +
+        // Load html2canvas from CDN if not present
+        "    if (window.html2canvas) {" +
+        "      doCapture();" +
+        "    } else {" +
+        "      var sc = document.createElement('script');" +
+        "      sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';" +
+        "      sc.onload = doCapture;" +
+        "      sc.onerror = function() {" +
+        // Fallback: send full page HTML to render server-side
+        "        window.AndroidSlip.receiveImageBase64('');" +
+        "      };" +
+        "      document.head.appendChild(sc);" +
+        "    }" +
+        "  }" +
+
+        // ── 1. Override window.print() ──
+        "  window.print = function() { captureAndSend(); };" +
+
+        // ── 2. Override window.open() (print popup pattern) ──
+        "  var _origOpen = window.open.bind(window);" +
+        "  window.open = function(url, target, features) {" +
+        "    if (!url || url===''||url==='about:blank') {" +
+        "      var _html='';" +
+        "      var fakeWin = {" +
+        "        document: {" +
+        "          write:function(s){_html+=s;}," +
+        "          writeln:function(s){_html+=s;}," +
+        "          close:function(){}" +
+        "        }," +
+        "        print:function(){" +
+        "          window.AndroidSlip.showLoadingDialog();" +
+        "          if(window.html2canvas){" +
+        "            var d=document.createElement('div');" +
+        "            d.style.cssText='position:fixed;left:-9999px;top:0;background:#fff;';" +
+        "            d.innerHTML=_html;" +
+        "            document.body.appendChild(d);" +
+        "            html2canvas(d,{scale:2,backgroundColor:'#ffffff'}).then(function(c){" +
+        "              document.body.removeChild(d);" +
+        "              window.AndroidSlip.receiveImageBase64(c.toDataURL('image/jpeg',0.93).split(',')[1]);" +
+        "            });" +
+        "          } else { captureAndSend(); }" +
+        "        }," +
+        "        focus:function(){}," +
+        "        close:function(){}" +
+        "      };" +
+        "      return fakeWin;" +
+        "    }" +
+        "    if (url&&(url.startsWith('blob:')||url.startsWith('data:application/pdf'))) {" +
+        "      window._interceptBlob(url); return null;" +
+        "    }" +
+        "    return _origOpen(url,target,features);" +
+        "  };" +
+
+        // ── 3. Blob/data URL interceptor → send PDF as base64 ──
+        "  window._interceptBlob = function(url) {" +
+        "    window.AndroidSlip.showLoadingDialog();" +
+        "    if (url.startsWith('data:application/pdf;base64,')) {" +
+        "      window.AndroidSlip.receivePdfBase64(url.substring(28)); return;" +
+        "    }" +
+        "    fetch(url)" +
+        "      .then(function(r){return r.blob();})" +
+        "      .then(function(blob){" +
+        "        var rd=new FileReader();" +
+        "        rd.onloadend=function(){window.AndroidSlip.receivePdfBase64(rd.result.split(',')[1]);};" +
+        "        rd.readAsDataURL(blob);" +
+        "      }).catch(function(){});" +
+        "  };" +
+
+        // ── 4. Intercept <a download> clicks (jsPDF anchor trick) ──
+        "  document.addEventListener('click',function(e){" +
+        "    var a=e.target.closest?e.target.closest('a[download]'):null;" +
+        "    if (!a) return;" +
+        "    var href=a.href||'';" +
+        "    if (href.startsWith('blob:')||href.startsWith('data:')) {" +
+        "      e.preventDefault(); e.stopPropagation();" +
+        "      window._interceptBlob(href);" +
+        "    }" +
+        "  },true);" +
+
+        "  console.log('AndroidSlip bridge v4 ready');" +
+        "})();";
+
         v.evaluateJavascript(js, null);
     }
 
-    private void renderSlipToPdf(String html) {
-        AlertDialog loading = new AlertDialog.Builder(this)
-            .setMessage("স্লিপ তৈরি হচ্ছে...")
-            .setCancelable(false).create();
-        loading.show();
+    // ═══════════════════════════════════════════════════
+    //  Image Preview Dialog  (main share UI)
+    // ═══════════════════════════════════════════════════
+    private void showImagePreview(Bitmap bmp) {
+        // Save JPEG to cache for sharing
+        String fn  = "miron_slip_" + System.currentTimeMillis() + ".jpg";
+        File imgFile = new File(getCacheDir(), fn);
+        try {
+            FileOutputStream fos = new FileOutputStream(imgFile);
+            bmp.compress(Bitmap.CompressFormat.JPEG, 93, fos);
+            fos.flush(); fos.close();
+        } catch (Exception e) {
+            toast("ছবি সেভ ব্যর্থ: " + e.getMessage()); return;
+        }
+        Uri imgUri = FileProvider.getUriForFile(
+            this, getPackageName() + ".provider", imgFile);
 
-        WebView renderer = new WebView(this);
-        renderer.setBackgroundColor(Color.WHITE);
-        int w = getResources().getDisplayMetrics().widthPixels;
-        renderer.layout(0, 0, w, 10);
-        WebSettings ws = renderer.getSettings();
-        ws.setJavaScriptEnabled(true);
-        ws.setDomStorageEnabled(true);
-        ws.setLoadWithOverviewMode(false);
-        ws.setUseWideViewPort(false);
+        // ── Build dialog layout ──
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.WHITE);
 
-        renderer.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                view.postDelayed(() -> {
-                    try {
-                        float density = getResources().getDisplayMetrics().density;
-                        int contentH = (int)(view.getContentHeight() * density);
-                        if (contentH <= 0) contentH = 800;
-                        view.layout(0, 0, w, contentH);
+        // Header
+        TextView header = new TextView(this);
+        header.setText("✅ স্লিপ/রিপোর্ট তৈরি হয়েছে");
+        header.setTextSize(16); header.setTypeface(null, android.graphics.Typeface.BOLD);
+        header.setTextColor(Color.parseColor("#0D47A1"));
+        header.setGravity(Gravity.CENTER);
+        header.setPadding(20, 20, 20, 12);
+        root.addView(header);
 
-                        Bitmap bmp = Bitmap.createBitmap(w, contentH, Bitmap.Config.ARGB_8888);
-                        bmp.eraseColor(Color.WHITE);
-                        view.draw(new Canvas(bmp));
+        // Image preview (scrollable for tall slips)
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.parseColor("#F5F5F5"));
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(320));
+        scroll.setLayoutParams(sp);
 
-                        PdfDocument pdf = new PdfDocument();
-                        float scaleX = 419f / w;
-                        int pdfH = (int)(contentH * scaleX);
-                        PdfDocument.PageInfo pi = new PdfDocument.PageInfo
-                            .Builder(419, Math.max(pdfH, 100), 1).create();
-                        PdfDocument.Page page = pdf.startPage(pi);
-                        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-                        paint.setFilterBitmap(true);
-                        android.graphics.Matrix mx = new android.graphics.Matrix();
-                        mx.setScale(scaleX, scaleX);
-                        page.getCanvas().drawBitmap(bmp, mx, paint);
-                        pdf.finishPage(page);
+        ImageView img = new ImageView(this);
+        img.setImageBitmap(bmp);
+        img.setAdjustViewBounds(true);
+        img.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        img.setPadding(8, 8, 8, 8);
+        scroll.addView(img);
+        root.addView(scroll);
 
-                        String fileName = "miron_slip_" + System.currentTimeMillis() + ".pdf";
-                        File pdfFile = new File(getCacheDir(), fileName);
-                        FileOutputStream fos = new FileOutputStream(pdfFile);
-                        pdf.writeTo(fos); fos.flush(); fos.close();
-                        pdf.close(); bmp.recycle();
+        // Divider
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.parseColor("#E0E0E0"));
+        divider.setLayoutParams(new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 1));
+        root.addView(divider);
 
-                        Uri pdfUri = FileProvider.getUriForFile(
-                            MainActivity.this, getPackageName() + ".provider", pdfFile);
+        // Buttons
+        LinearLayout btns = new LinearLayout(this);
+        btns.setOrientation(LinearLayout.VERTICAL);
+        btns.setPadding(20, 16, 20, 20);
+        btns.setBackgroundColor(Color.WHITE);
 
-                        loading.dismiss();
-                        renderer.destroy();
-                        showSlipOptions(pdfUri, pdfFile, fileName);
+        Button waBtn    = makeBtn("📲  WhatsApp এ পাঠান",         "#25D366");
+        Button waBizBtn = makeBtn("💼  WA Business এ পাঠান",      "#075E54");
+        Button galBtn   = makeBtn("🖼   গ্যালারিতে সেভ করুন",      "#1565C0");
+        Button shareBtn = makeBtn("📤  অন্য App এ শেয়ার করুন",    "#37474F");
+        Button closeBtn = makeBtn("✖   বন্ধ করুন",                "#9E9E9E");
 
-                    } catch (Exception e) {
-                        loading.dismiss(); renderer.destroy();
-                        new AlertDialog.Builder(MainActivity.this)
-                            .setMessage("স্লিপ তৈরিতে সমস্যা: " + e.getMessage())
-                            .setPositiveButton("ঠিক আছে", null).show();
-                    }
-                }, 1400);
-            }
+        btns.addView(waBtn);
+        btns.addView(waBizBtn);
+        btns.addView(galBtn);
+        btns.addView(shareBtn);
+        btns.addView(closeBtn);
+        root.addView(btns);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setView(root).create();
+
+        final File finalImgFile = imgFile;
+        final Uri finalImgUri = imgUri;
+        final Bitmap finalBmp = bmp;
+
+        waBtn.setOnClickListener(v    -> { shareImageViaApp(finalImgUri, "com.whatsapp");    dialog.dismiss(); });
+        waBizBtn.setOnClickListener(v -> { shareImageViaApp(finalImgUri, "com.whatsapp.w4b"); dialog.dismiss(); });
+        galBtn.setOnClickListener(v   -> { saveImageToGallery(finalBmp, fn); dialog.dismiss(); });
+        shareBtn.setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_SEND);
+            i.setType("image/jpeg");
+            i.putExtra(Intent.EXTRA_STREAM, finalImgUri);
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(i, "শেয়ার করুন"));
+            dialog.dismiss();
         });
+        closeBtn.setOnClickListener(v -> dialog.dismiss());
 
-        renderer.loadDataWithBaseURL(APP_URL, html, "text/html", "UTF-8", null);
+        dialog.show();
+        Window w = dialog.getWindow();
+        if (w != null) {
+            w.setLayout(WindowManager.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.WRAP_CONTENT);
+        }
     }
 
-    private void showSlipOptions(Uri pdfUri, File pdfFile, String fileName) {
+    // ═══════════════════════════════════════════════════
+    //  PDF options dialog (for report downloads)
+    // ═══════════════════════════════════════════════════
+    private void showPdfOptions(Uri pdfUri, File pdfFile, String fileName) {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(28, 28, 28, 20);
+        layout.setPadding(24, 24, 24, 20);
         layout.setBackgroundColor(Color.WHITE);
 
         TextView title = new TextView(this);
-        title.setText("✅ স্লিপ PDF তৈরি হয়েছে");
-        title.setTextSize(17);
+        title.setText("📊 রিপোর্ট PDF তৈরি হয়েছে");
+        title.setTextSize(16); title.setTypeface(null, android.graphics.Typeface.BOLD);
         title.setTextColor(Color.parseColor("#0D47A1"));
         title.setGravity(Gravity.CENTER);
-        title.setPadding(0, 0, 0, 22);
-        title.setTypeface(null, android.graphics.Typeface.BOLD);
+        title.setPadding(0, 0, 0, 20);
         layout.addView(title);
 
-        Button waBtn    = makeBtn("📲  WhatsApp এ শেয়ার",         "#25D366");
-        Button waBizBtn = makeBtn("💼  WhatsApp Business শেয়ার",  "#075E54");
-        Button shareBtn = makeBtn("📤  অন্য App এ শেয়ার",          "#0D47A1");
-        Button saveBtn  = makeBtn("💾  ডাউনলোড ফোল্ডারে সেভ",     "#37474F");
+        Button waBtn    = makeBtn("📲  WhatsApp এ পাঠান",         "#25D366");
+        Button waBizBtn = makeBtn("💼  WA Business এ পাঠান",      "#075E54");
+        Button saveBtn  = makeBtn("💾  ডাউনলোড ফোল্ডারে সেভ",     "#1565C0");
+        Button shareBtn = makeBtn("📤  অন্য App এ শেয়ার",          "#37474F");
         Button openBtn  = makeBtn("👁   PDF দেখুন",                 "#546E7A");
 
-        layout.addView(waBtn);
-        layout.addView(waBizBtn);
-        layout.addView(shareBtn);
-        layout.addView(saveBtn);
-        layout.addView(openBtn);
+        layout.addView(waBtn); layout.addView(waBizBtn);
+        layout.addView(saveBtn); layout.addView(shareBtn); layout.addView(openBtn);
 
         AlertDialog dialog = new AlertDialog.Builder(this).setView(layout).create();
 
-        waBtn.setOnClickListener(v    -> { shareViaApp(pdfUri, "com.whatsapp");     dialog.dismiss(); });
-        waBizBtn.setOnClickListener(v -> { shareViaApp(pdfUri, "com.whatsapp.w4b"); dialog.dismiss(); });
+        waBtn.setOnClickListener(v    -> { sharePdfViaApp(pdfUri, "com.whatsapp");     dialog.dismiss(); });
+        waBizBtn.setOnClickListener(v -> { sharePdfViaApp(pdfUri, "com.whatsapp.w4b"); dialog.dismiss(); });
+        saveBtn.setOnClickListener(v  -> { savePdfToDownloads(pdfFile, fileName);       dialog.dismiss(); });
         shareBtn.setOnClickListener(v -> {
             Intent i = new Intent(Intent.ACTION_SEND);
             i.setType("application/pdf");
             i.putExtra(Intent.EXTRA_STREAM, pdfUri);
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(i, "স্লিপ শেয়ার করুন"));
+            startActivity(Intent.createChooser(i, "শেয়ার করুন"));
             dialog.dismiss();
         });
-        saveBtn.setOnClickListener(v  -> { savePdfToDownloads(pdfFile, fileName); dialog.dismiss(); });
         openBtn.setOnClickListener(v  -> {
             Intent i = new Intent(Intent.ACTION_VIEW);
             i.setDataAndType(pdfUri, "application/pdf");
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             try { startActivity(i); }
-            catch (Exception e) {
-                new AlertDialog.Builder(this)
-                    .setMessage("PDF viewer নেই। Google Drive বা Files app ইনস্টল করুন।")
-                    .setPositiveButton("ঠিক আছে", null).show();
-            }
+            catch (Exception e) { toast("PDF viewer নেই। Files app ইনস্টল করুন।"); }
             dialog.dismiss();
         });
 
         dialog.show();
-        Window w2 = dialog.getWindow();
-        if (w2 != null) w2.setLayout(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT);
+        Window w = dialog.getWindow();
+        if (w != null) w.setLayout(WindowManager.LayoutParams.MATCH_PARENT,
+                                    WindowManager.LayoutParams.WRAP_CONTENT);
     }
 
-    private void shareViaApp(Uri pdfUri, String pkg) {
+    // ═══════════════════════════════════════════════════
+    //  Helpers
+    // ═══════════════════════════════════════════════════
+    private void shareImageViaApp(Uri uri, String pkg) {
         try {
             Intent i = new Intent(Intent.ACTION_SEND);
-            i.setType("application/pdf"); i.setPackage(pkg);
-            i.putExtra(Intent.EXTRA_STREAM, pdfUri);
+            i.setType("image/jpeg"); i.setPackage(pkg);
+            i.putExtra(Intent.EXTRA_STREAM, uri);
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(i);
         } catch (Exception e) {
-            // WhatsApp not installed — fall back to generic share chooser
-            Intent fallback = new Intent(Intent.ACTION_SEND);
-            fallback.setType("application/pdf");
-            fallback.putExtra(Intent.EXTRA_STREAM, pdfUri);
-            fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(fallback, "শেয়ার করুন"));
+            Intent fb = new Intent(Intent.ACTION_SEND);
+            fb.setType("image/jpeg");
+            fb.putExtra(Intent.EXTRA_STREAM, uri);
+            fb.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(fb, "শেয়ার করুন"));
+        }
+    }
+
+    private void sharePdfViaApp(Uri uri, String pkg) {
+        try {
+            Intent i = new Intent(Intent.ACTION_SEND);
+            i.setType("application/pdf"); i.setPackage(pkg);
+            i.putExtra(Intent.EXTRA_STREAM, uri);
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(i);
+        } catch (Exception e) {
+            Intent fb = new Intent(Intent.ACTION_SEND);
+            fb.setType("application/pdf");
+            fb.putExtra(Intent.EXTRA_STREAM, uri);
+            fb.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(fb, "শেয়ার করুন"));
+        }
+    }
+
+    private void saveImageToGallery(Bitmap bmp, String fileName) {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                ContentValues cv = new ContentValues();
+                cv.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+                cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                cv.put(MediaStore.Images.Media.IS_PENDING, 1);
+                Uri dest = getContentResolver().insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                if (dest == null) throw new Exception("Gallery error");
+                try (OutputStream out = getContentResolver().openOutputStream(dest)) {
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 93, out);
+                }
+                cv.clear();
+                cv.put(MediaStore.Images.Media.IS_PENDING, 0);
+                getContentResolver().update(dest, cv, null, null);
+            } else {
+                File pics = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_PICTURES);
+                if (!pics.exists()) pics.mkdirs();
+                File out = new File(pics, fileName);
+                FileOutputStream fos = new FileOutputStream(out);
+                bmp.compress(Bitmap.CompressFormat.JPEG, 93, fos);
+                fos.flush(); fos.close();
+                // Notify gallery
+                sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE,
+                    Uri.fromFile(out)));
+            }
+            toast("✅ গ্যালারিতে সেভ হয়েছে!");
+        } catch (Exception e) {
+            toast("সেভ ব্যর্থ: " + e.getMessage());
         }
     }
 
     private void savePdfToDownloads(File srcFile, String fileName) {
         try {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
-                values.put(MediaStore.Downloads.MIME_TYPE, "application/pdf");
-                values.put(MediaStore.Downloads.IS_PENDING, 1);
+                ContentValues cv = new ContentValues();
+                cv.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                cv.put(MediaStore.Downloads.MIME_TYPE, "application/pdf");
+                cv.put(MediaStore.Downloads.IS_PENDING, 1);
                 Uri dest = getContentResolver().insert(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
                 if (dest == null) throw new Exception("Storage error");
                 try (InputStream in  = new FileInputStream(srcFile);
                      OutputStream out = getContentResolver().openOutputStream(dest)) {
                     byte[] buf = new byte[4096]; int n;
                     while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
                 }
-                values.clear();
-                values.put(MediaStore.Downloads.IS_PENDING, 0);
-                getContentResolver().update(dest, values, null, null);
+                cv.clear();
+                cv.put(MediaStore.Downloads.IS_PENDING, 0);
+                getContentResolver().update(dest, cv, null, null);
             } else {
-                File downloads = Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS);
-                if (!downloads.exists()) downloads.mkdirs();
-                File out = new File(downloads, fileName);
+                File dl = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_DOWNLOADS);
+                if (!dl.exists()) dl.mkdirs();
+                File out = new File(dl, fileName);
                 try (InputStream in  = new FileInputStream(srcFile);
                      OutputStream os = new FileOutputStream(out)) {
                     byte[] buf = new byte[4096]; int n;
                     while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
                 }
             }
-            new AlertDialog.Builder(this)
-                .setMessage("✅ '" + fileName + "'\nডাউনলোড ফোল্ডারে সেভ হয়েছে!")
-                .setPositiveButton("ঠিক আছে", null).show();
+            toast("✅ ডাউনলোড ফোল্ডারে সেভ হয়েছে!");
         } catch (Exception e) {
-            new AlertDialog.Builder(this)
-                .setMessage("সেভ করতে সমস্যা: " + e.getMessage())
-                .setPositiveButton("ঠিক আছে", null).show();
+            toast("সেভ ব্যর্থ: " + e.getMessage());
         }
+    }
+
+    private void showLoading(String msg) {
+        if (loadingDialog != null && loadingDialog.isShowing()) return;
+        loadingDialog = new AlertDialog.Builder(this)
+            .setMessage(msg).setCancelable(false).create();
+        loadingDialog.show();
+    }
+
+    private void dismissLoading() {
+        if (loadingDialog != null && loadingDialog.isShowing())
+            loadingDialog.dismiss();
+        loadingDialog = null;
+    }
+
+    private void toast(String msg) {
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+    }
+
+    private int dpToPx(int dp) {
+        return (int)(dp * getResources().getDisplayMetrics().density);
     }
 
     private Button makeBtn(String text, String color) {
@@ -292,11 +510,14 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT);
-        p.setMargins(0, 0, 0, 12);
+        p.setMargins(0, 0, 0, 10);
         b.setLayoutParams(p);
         return b;
     }
 
+    // ═══════════════════════════════════════════════════
+    //  onCreate
+    // ═══════════════════════════════════════════════════
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -325,22 +546,75 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(true);
         s.setAllowContentAccess(true);
         s.setMediaPlaybackRequiresUserGesture(false);
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(true);
 
         webView.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
+
+        // ── Intercept blob/data downloads (report PDFs, jsPDF output) ──
+        webView.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+            showLoading("ডাউনলোড হচ্ছে...");
+            if (url.startsWith("blob:")) {
+                // Fetch blob via JS and send base64 to bridge
+                String js = "javascript:(function(){" +
+                    "fetch('" + url + "')" +
+                    ".then(function(r){return r.blob();})" +
+                    ".then(function(b){" +
+                    "  var rd=new FileReader();" +
+                    "  rd.onloadend=function(){" +
+                    "    var parts=rd.result.split(',');" +
+                    "    var mt=parts[0];" +
+                    "    var b64=parts[1];" +
+                    "    if(mt.indexOf('pdf')>-1)" +
+                    "      window.AndroidSlip.receivePdfBase64(b64);" +
+                    "    else" +
+                    "      window.AndroidSlip.receiveImageBase64(b64);" +
+                    "  };" +
+                    "  rd.readAsDataURL(b);" +
+                    "}).catch(function(){});})();";
+                webView.loadUrl(js);
+            } else if (mimeType != null && mimeType.contains("pdf") &&
+                       url.startsWith("data:")) {
+                String b64 = url.contains(",") ? url.substring(url.indexOf(',')+1) : url;
+                new SlipBridge().receivePdfBase64(b64);
+            } else {
+                dismissLoading();
+            }
+        });
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
-                v.loadUrl(r.getUrl().toString()); return true;
+                String url = r.getUrl().toString();
+                // Catch any navigation to blob: (some apps navigate instead of download)
+                if (url.startsWith("blob:")) {
+                    showLoading("তৈরি হচ্ছে...");
+                    String js = "javascript:(function(){" +
+                        "fetch('" + url + "')" +
+                        ".then(function(r){return r.blob();})" +
+                        ".then(function(b){" +
+                        "  var rd=new FileReader();" +
+                        "  rd.onloadend=function(){" +
+                        "    var b64=rd.result.split(',')[1];" +
+                        "    window.AndroidSlip.receivePdfBase64(b64);" +
+                        "  };" +
+                        "  rd.readAsDataURL(b);" +
+                        "}).catch(function(){});})();";
+                    v.loadUrl(js);
+                    return true;
+                }
+                v.loadUrl(url);
+                return true;
             }
+
             @Override
             public void onPageFinished(WebView v, String url) {
                 super.onPageFinished(v, url);
                 offlineLayout.setVisibility(View.GONE);
                 webView.setVisibility(View.VISIBLE);
-                // Inject window.print() override on every page load
-                injectPrintOverride(v);
+                injectBridgeOverrides(v);
             }
+
             @Override
             public void onReceivedError(WebView v, WebResourceRequest r,
                     android.webkit.WebResourceError e) {
@@ -376,10 +650,40 @@ public class MainActivity extends Activity {
                 catch (Exception e) { fileChooserCallback = null; return false; }
                 return true;
             }
+            // Handle window.open() popups (print-in-popup pattern)
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog,
+                    boolean isUserGesture, android.os.Message resultMsg) {
+                WebView popup = new WebView(MainActivity.this);
+                WebSettings ps = popup.getSettings();
+                ps.setJavaScriptEnabled(true);
+                ps.setDomStorageEnabled(true);
+                popup.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
+                popup.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageFinished(WebView pv, String url) {
+                        pv.postDelayed(() ->
+                            pv.evaluateJavascript(
+                                "(function(){return document.documentElement.outerHTML;})();",
+                                html -> {
+                                    if (html != null && !html.equals("null") && html.length() > 10) {
+                                        // Render popup HTML using html2canvas via injection
+                                        injectBridgeOverrides(pv);
+                                        pv.evaluateJavascript("window.print();", null);
+                                    }
+                                }), 800);
+                    }
+                });
+                WebView.WebViewTransport t = (WebView.WebViewTransport) resultMsg.obj;
+                t.setWebView(popup);
+                resultMsg.sendToTarget();
+                return true;
+            }
         });
 
         root.addView(webView);
 
+        // ── Offline screen ──
         offlineLayout = new LinearLayout(this);
         offlineLayout.setOrientation(LinearLayout.VERTICAL);
         offlineLayout.setGravity(Gravity.CENTER);
