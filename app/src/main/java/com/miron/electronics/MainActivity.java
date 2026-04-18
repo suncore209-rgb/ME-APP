@@ -144,15 +144,7 @@ public class MainActivity extends Activity {
         "  if (window._meBridgeReady) return;" +
         "  window._meBridgeReady = true;" +
 
-        // ── Block window.open so web app falls into receiveSlip branch ──
-        // The web app does:
-        //   var win = window.open(...);
-        //   if (win) { win.document.write(html); }
-        //   else if (window.AndroidSlip) { window.AndroidSlip.receiveSlip(html, ''); }
-        // By returning null, receiveSlip() gets called with the full HTML.
-        "  window.open = function() { return null; };" +
-
-        // ── Capture current page for Report's window.print() button ──
+        // Capture current page → receiveImageBase64
         "  function captureCurrentPage() {" +
         "    if (typeof window.AndroidSlip === 'undefined') return;" +
         "    window.AndroidSlip.showLoadingDialog();" +
@@ -178,7 +170,7 @@ public class MainActivity extends Activity {
         "    }" +
         "  }" +
 
-        // ── Override window.print → capture (Report page PDF button) ──
+        // Override window.print → capture (used by Report page)
         "  window.print = function() { captureCurrentPage(); };" +
 
         "})();";
@@ -218,7 +210,8 @@ public class MainActivity extends Activity {
         "})();";
 
         showLoading("স্লিপ ক্যাপচার হচ্ছে...");
-        popup.postDelayed(() -> popup.evaluateJavascript(js, null), 800);
+        // 1500ms gives Google Fonts and product thumbnails time to load
+        popup.postDelayed(() -> popup.evaluateJavascript(js, null), 1500);
     }
 
     // ═══════════════════════════════════════════════════
@@ -518,30 +511,16 @@ public class MainActivity extends Activity {
                 ps.setUseWideViewPort(true);
                 popup.addJavascriptInterface(new SlipBridge(), "AndroidSlip");
 
-                // Only inject print override — do NOT auto-capture.
-                // User sees the slip popup, taps "PDF ডাউনলোড / প্রিন্ট"
-                // which calls window.print() → our override captures it.
+                // Auto-capture the popup as soon as it loads.
+                // The popup is invisible in Android WebView (window.open creates
+                // a detached WebView that is never shown). So we capture it
+                // immediately with html2canvas and show our share dialog.
                 popup.setWebViewClient(new WebViewClient() {
                     @Override
                     public void onPageFinished(WebView pv, String url) {
-                        String printOverride =
-                            "(function(){" +
-                            "  window.print = function() {" +
-                            "    window.AndroidSlip.showLoadingDialog();" +
-                            "    var btns=document.querySelector('.btns');" +
-                            "    if(btns)btns.style.display='none';" +
-                            "    var sc=document.createElement('script');" +
-                            "    sc.src='https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';" +
-                            "    sc.onload=function(){" +
-                            "      html2canvas(document.body,{scale:2,useCORS:true,allowTaint:true,backgroundColor:'#ffffff',logging:false})" +
-                            "      .then(function(c){" +
-                            "        window.AndroidSlip.receiveImageBase64(c.toDataURL('image/jpeg',0.93).split(',')[1]);" +
-                            "      }).catch(function(){window.AndroidSlip.receiveImageBase64('');});" +
-                            "    };" +
-                            "    if(window.html2canvas){sc.onload();}else{document.head.appendChild(sc);}" +
-                            "  };" +
-                            "})();";
-                        pv.postDelayed(() -> pv.evaluateJavascript(printOverride, null), 400);
+                        // Give the slip HTML time to fully render fonts/images,
+                        // then auto-capture — no user button tap required.
+                        capturePopupWebView(pv);
                     }
                 });
 
