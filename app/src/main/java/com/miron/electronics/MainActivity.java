@@ -41,14 +41,14 @@ import java.io.OutputStream;
 
 public class MainActivity extends Activity {
 
-    private static final String APP_URL = "https://me-amber-two.vercel.app/";
+    private static final String APP_URL = "https://me-nine-pearl.vercel.app/";
     private static final int FILE_CHOOSER_REQUEST = 100;
 
     private WebView webView;
     private LinearLayout offlineLayout;
     private ValueCallback<Uri[]> fileChooserCallback;
 
-    // JS Bridge — receives slip HTML from web app
+    // JS Bridge
     public class SlipBridge {
         @JavascriptInterface
         public void receiveSlip(final String html, final String slipText) {
@@ -56,7 +56,47 @@ public class MainActivity extends Activity {
         }
     }
 
-    // Render slip HTML → PDF via offscreen WebView
+    /**
+     * KEY FIX: Inject JS that overrides window.print().
+     * WebView does NOT support window.print() — the screen goes white.
+     * We intercept it, grab the slip HTML, and send to our PDF renderer.
+     */
+    private void injectPrintOverride(WebView v) {
+        String js = "(function() {\n" +
+            "  window.print = function() {\n" +
+            "    try {\n" +
+            "      var selectors = ['#slip','.slip','[id*=\"slip\"]','[class*=\"slip\"]',\n" +
+            "                       '#printable','.printable','.invoice','#invoice',\n" +
+            "                       '[id*=\"challan\"]','[class*=\"challan\"]',\n" +
+            "                       '[id*=\"receipt\"]','[class*=\"receipt\"]'];\n" +
+            "      var el = null;\n" +
+            "      for (var s = 0; s < selectors.length; s++) {\n" +
+            "        el = document.querySelector(selectors[s]);\n" +
+            "        if (el) break;\n" +
+            "      }\n" +
+            "      var styles = '';\n" +
+            "      try {\n" +
+            "        var sheets = document.styleSheets;\n" +
+            "        for (var i = 0; i < sheets.length; i++) {\n" +
+            "          var rules;\n" +
+            "          try { rules = sheets[i].cssRules || sheets[i].rules; } catch(e) { continue; }\n" +
+            "          if (rules) { for (var j = 0; j < rules.length; j++) { styles += rules[j].cssText + '\\n'; } }\n" +
+            "        }\n" +
+            "      } catch(e) {}\n" +
+            "      var body = el ? el.outerHTML : document.body.innerHTML;\n" +
+            "      var fullHtml = '<!DOCTYPE html><html><head><meta charset=\"utf-8\">'\n" +
+            "        + '<meta name=\"viewport\" content=\"width=device-width\">'\n" +
+            "        + '<style>body{margin:0;padding:12px;background:#fff;font-family:sans-serif;}' + styles + '</style>'\n" +
+            "        + '</head><body>' + body + '</body></html>';\n" +
+            "      window.AndroidSlip.receiveSlip(fullHtml, '');\n" +
+            "    } catch(err) {\n" +
+            "      window.AndroidSlip.receiveSlip(document.documentElement.outerHTML, '');\n" +
+            "    }\n" +
+            "  };\n" +
+            "})();";
+        v.evaluateJavascript(js, null);
+    }
+
     private void renderSlipToPdf(String html) {
         AlertDialog loading = new AlertDialog.Builder(this)
             .setMessage("স্লিপ তৈরি হচ্ছে...")
@@ -80,6 +120,7 @@ public class MainActivity extends Activity {
                     try {
                         float density = getResources().getDisplayMetrics().density;
                         int contentH = (int)(view.getContentHeight() * density);
+                        if (contentH <= 0) contentH = 800;
                         view.layout(0, 0, w, contentH);
 
                         Bitmap bmp = Bitmap.createBitmap(w, contentH, Bitmap.Config.ARGB_8888);
@@ -118,15 +159,13 @@ public class MainActivity extends Activity {
                             .setMessage("স্লিপ তৈরিতে সমস্যা: " + e.getMessage())
                             .setPositiveButton("ঠিক আছে", null).show();
                     }
-                }, 1200);
+                }, 1400);
             }
         });
 
-        renderer.loadDataWithBaseURL(
-            "https://fonts.gstatic.com", html, "text/html", "UTF-8", null);
+        renderer.loadDataWithBaseURL(APP_URL, html, "text/html", "UTF-8", null);
     }
 
-    // Slip options: WhatsApp / WA Business / Share / Save / View
     private void showSlipOptions(Uri pdfUri, File pdfFile, String fileName) {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -156,7 +195,7 @@ public class MainActivity extends Activity {
 
         AlertDialog dialog = new AlertDialog.Builder(this).setView(layout).create();
 
-        waBtn.setOnClickListener(v    -> { shareViaApp(pdfUri, "com.whatsapp");    dialog.dismiss(); });
+        waBtn.setOnClickListener(v    -> { shareViaApp(pdfUri, "com.whatsapp");     dialog.dismiss(); });
         waBizBtn.setOnClickListener(v -> { shareViaApp(pdfUri, "com.whatsapp.w4b"); dialog.dismiss(); });
         shareBtn.setOnClickListener(v -> {
             Intent i = new Intent(Intent.ACTION_SEND);
@@ -195,9 +234,12 @@ public class MainActivity extends Activity {
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(i);
         } catch (Exception e) {
-            new AlertDialog.Builder(this)
-                .setMessage("App পাওয়া যায়নি। অন্য অপশন ব্যবহার করুন।")
-                .setPositiveButton("ঠিক আছে", null).show();
+            // WhatsApp not installed — fall back to generic share chooser
+            Intent fallback = new Intent(Intent.ACTION_SEND);
+            fallback.setType("application/pdf");
+            fallback.putExtra(Intent.EXTRA_STREAM, pdfUri);
+            fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(fallback, "শেয়ার করুন"));
         }
     }
 
@@ -255,7 +297,6 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    // ── onCreate — pure fullscreen WebView, no top bar ──
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -269,7 +310,6 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.MATCH_PARENT));
 
-        // Full-screen WebView
         webView = new WebView(this);
         webView.setLayoutParams(new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -298,6 +338,8 @@ public class MainActivity extends Activity {
                 super.onPageFinished(v, url);
                 offlineLayout.setVisibility(View.GONE);
                 webView.setVisibility(View.VISIBLE);
+                // Inject window.print() override on every page load
+                injectPrintOverride(v);
             }
             @Override
             public void onReceivedError(WebView v, WebResourceRequest r,
@@ -338,7 +380,6 @@ public class MainActivity extends Activity {
 
         root.addView(webView);
 
-        // Offline screen
         offlineLayout = new LinearLayout(this);
         offlineLayout.setOrientation(LinearLayout.VERTICAL);
         offlineLayout.setGravity(Gravity.CENTER);
